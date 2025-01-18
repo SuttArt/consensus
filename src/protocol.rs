@@ -1,5 +1,7 @@
 //! Contains the network-message-types for the consensus protocol and banking application.
-use crate::network::Channel;
+
+use std::collections::HashMap;
+use crate::network::{Channel, Connection, NetworkNode};
 
 /// Message-type of the network protocol.
 #[derive(Debug)]
@@ -23,6 +25,32 @@ pub enum Command {
 }
 
 // TODO: add other useful structures and implementations
+pub struct Actor {
+	pub node: NetworkNode<Command>,
+	state: ActorState,
+	current_term: usize,
+	log: Vec<(usize, Command)>,
+	// we use not Channel<Command>, but <Connection<Command>. Seems like Channel.send() shouldn't be used for sending
+	pub connections: Vec<Connection<Command>>,
+}
+
+enum ActorState {
+	Leader,
+	Follower,
+	Candidate,
+}
+
+impl Actor {
+	pub fn new(node: NetworkNode<Command>) -> Self {
+		Actor {
+			node,
+			state: ActorState::Follower, // starts always with Follower
+			current_term: 0,
+			log: Vec::new(),
+			connections: Vec::new(),
+		}
+	}
+}
 
 /// Helper macro for defining test-scenarios.
 /// 

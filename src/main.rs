@@ -7,7 +7,7 @@ use rand::prelude::*;
 use tracing::{debug, info, Level, trace, trace_span};
 
 use network::{Channel, daemon, NetworkNode};
-use protocol::Command;
+use protocol::{Command, Actor};
 
 pub mod network;
 pub mod protocol;
@@ -23,32 +23,54 @@ pub fn setup_offices(office_count: usize, log_path: &str) -> io::Result<Vec<Chan
 	for address in 0..office_count {
 		let node = NetworkNode::new(address, &log_path)?;
 		channels.push(node.channel());
+
+		let mut actor = Actor::new(node);
 		
 		thread::spawn(move || {
 			// configure a span to associate log-entries with this network node
-			let _guard = trace_span!("NetworkNode", id = node.address);
+			let _guard = trace_span!("NetworkNode", id = actor.node.address);
 			let _guard = _guard.enter();
 			
 			// dispatching event loop
-			while let Ok(cmd) = node.decode(None) {
+			while let Ok(cmd) = actor.node.decode(None) {
 				match cmd {
 					// customer requests
 					Command::Open { account } => {
 						debug!("request to open an account for {:?}", account);
+
+						// connect to leader
+						// write to local log
+						// duplicate to another actors
+						// commit log item
+						// write to log
+
+						// cannot be undone, proof, if everything okay
+						actor.node.append(&Command::Open { account })
 					}
 					Command::Deposit { account, amount } => {
 						debug!(amount, ?account, "request to deposit");
+
+						// cannot be undone, proof, if everything okay
+						actor.node.append(&Command::Deposit { account, amount })
+
 					}
 					Command::Withdraw { account, amount } => {
 						debug!(amount, ?account, "request to withdraw");
+
+						// cannot be undone, proof, if everything okay
+						actor.node.append(&Command::Withdraw { account, amount })
 					}
 					Command::Transfer { src, dst, amount } => {
 						debug!(amount, ?src, ?dst, "request to transfer");
+
+						// cannot be undone, proof, if everything okay
+						actor.node.append(&Command::Transfer { src, dst, amount })
 					}
 					
 					// control messages
 					Command::Accept(channel) => {
 						trace!(origin = channel.address, "accepted connection");
+						actor.connections.push(actor.node.accept(channel));
 					}
 				}
 			}
@@ -82,7 +104,7 @@ fn main() -> io::Result<()> {
 	let copy = channels.clone();
 	
 	// activate the thread responsible for the disruption of connections
-	thread::spawn(move || daemon(copy, 1.0, 1.0));
+	thread::spawn(move || daemon(copy, 0.0, 1.0)); // TODO: Turn on for deploy
 	
 	// sample script for your convenience
 	script! {
