@@ -30,50 +30,8 @@ pub fn setup_offices(office_count: usize, log_path: &str) -> io::Result<Vec<Chan
 			// configure a span to associate log-entries with this network node
 			let _guard = trace_span!("NetworkNode", id = actor.node.address);
 			let _guard = _guard.enter();
-			
-			// dispatching event loop
-			while let Ok(cmd) = actor.node.decode(None) {
-				match cmd {
-					// customer requests
-					Command::Open { account } => {
-						debug!("request to open an account for {:?}", account);
 
-						// connect to leader
-						// write to local log
-						// duplicate to another actors
-						// commit log item
-						// write to log
-
-						// cannot be undone, proof, if everything okay
-						actor.node.append(&Command::Open { account })
-					}
-					Command::Deposit { account, amount } => {
-						debug!(amount, ?account, "request to deposit");
-
-						// cannot be undone, proof, if everything okay
-						actor.node.append(&Command::Deposit { account, amount })
-
-					}
-					Command::Withdraw { account, amount } => {
-						debug!(amount, ?account, "request to withdraw");
-
-						// cannot be undone, proof, if everything okay
-						actor.node.append(&Command::Withdraw { account, amount })
-					}
-					Command::Transfer { src, dst, amount } => {
-						debug!(amount, ?src, ?dst, "request to transfer");
-
-						// cannot be undone, proof, if everything okay
-						actor.node.append(&Command::Transfer { src, dst, amount })
-					}
-					
-					// control messages
-					Command::Accept(channel) => {
-						trace!(origin = channel.address, "accepted connection");
-						actor.connections.push(actor.node.accept(channel));
-					}
-				}
-			}
+			actor.main_loop();
 		});
 	}
 	

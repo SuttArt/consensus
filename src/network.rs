@@ -43,6 +43,7 @@ pub struct Channel<T> {
 }
 
 /// Unreliable one-directional connection between two virtual network nodes.
+#[derive(Debug)]
 pub struct Connection<T> {
 	/// Entry point for sending messages to the node that created this channel.
 	port: mpsc::Sender<T>,

@@ -1,6 +1,8 @@
 //! Contains the network-message-types for the consensus protocol and banking application.
 
+use std::cmp::PartialEq;
 use std::collections::HashMap;
+use tracing::{debug, trace};
 use crate::network::{Channel, Connection, NetworkNode};
 
 /// Message-type of the network protocol.
@@ -22,6 +24,8 @@ pub enum Command {
 	Accept(Channel<Command>),
 	
 	// TODO: add other useful control messages
+	RequestVote { src: usize, term: usize, log_term: usize, log_length: usize },
+	AppendEntries {}
 }
 
 // TODO: add other useful structures and implementations
@@ -29,11 +33,13 @@ pub struct Actor {
 	pub node: NetworkNode<Command>,
 	state: ActorState,
 	current_term: usize,
+	votes: usize,
 	log: Vec<(usize, Command)>,
 	// we use not Channel<Command>, but <Connection<Command>. Seems like Channel.send() shouldn't be used for sending
 	pub connections: Vec<Connection<Command>>,
 }
 
+#[derive(Debug, PartialEq)]
 enum ActorState {
 	Leader,
 	Follower,
@@ -46,8 +52,109 @@ impl Actor {
 			node,
 			state: ActorState::Follower, // starts always with Follower
 			current_term: 0,
+			votes: 0,
 			log: Vec::new(),
 			connections: Vec::new(),
+		}
+	}
+
+
+	pub fn main_loop(&mut self) {
+		loop {
+			while let Ok(cmd) = self.node.decode(None) {
+				match cmd {
+					// customer requests
+					Command::Open { account } => {
+						debug!("request to open an account for {:?}", account);
+
+						// connect to leader
+						// write to local log
+						// duplicate to another actors
+						// commit log item
+						// write to log
+
+						// cannot be undone, proof, if everything okay
+						self.node.append(&Command::Open { account })
+					}
+					Command::Deposit { account, amount } => {
+						debug!(amount, ?account, "request to deposit");
+
+						// cannot be undone, proof, if everything okay
+						self.node.append(&Command::Deposit { account, amount })
+
+					}
+					Command::Withdraw { account, amount } => {
+						debug!(amount, ?account, "request to withdraw");
+
+						// cannot be undone, proof, if everything okay
+						self.node.append(&Command::Withdraw { account, amount })
+					}
+					Command::Transfer { src, dst, amount } => {
+						debug!(amount, ?src, ?dst, "request to transfer");
+
+						// cannot be undone, proof, if everything okay
+						self.node.append(&Command::Transfer { src, dst, amount })
+					}
+
+					// control messages
+					Command::Accept(channel) => {
+						trace!(origin = channel.address, "accepted connection");
+						self.connections.push(self.node.accept(channel));
+					}
+
+					// Start the Vote
+					Command::RequestVote { src, term, log_term, log_length} => {
+						debug!(src, term, log_term, log_length, "request to start the vote");
+					}
+					_ => {}
+				}
+
+				/*
+				Election Basics
+				Increment current term
+				Change to Candidate state
+				Vote for self
+				Send RequestVote RPCs to all other servers, retry until either:
+					1. Receive votes from the majority of servers:
+						- Become leader
+						- Send AppendEntries heartbeats to all other servers
+					2. Receive RPC from valid leader:
+						- Return to follower state
+					3. No-one wins election (election timeout elapses):
+						- Increment term, start new election
+				*/
+				if self.state != ActorState::Leader {
+					self.current_term += 1;
+					self.state = ActorState::Candidate;
+					self.votes += 1;
+
+					for connection in &self.connections {
+						if connection.encode(Command::RequestVote {
+							src: self.node.address,
+							term: self.current_term,
+							log_term: self.log.last().map(|&(term, _)| term).unwrap_or(0),
+							log_length: self.log.len(),
+						}).is_ok() {
+							trace!(?connection, "Command::RequestVote sent successfully");
+						} else {
+							trace!(?connection, "Failed to send command Command::RequestVote");
+						};
+					}
+				}
+
+				if self.state == ActorState::Leader {
+					// Send AppendEntries heartbeats to all other servers
+					for connection in &self.connections {
+						if connection.encode(Command::AppendEntries {
+						}).is_ok() {
+							trace!(?connection, "Command::AppendEntries sent successfully");
+						} else {
+							trace!(?connection, "Failed to send command Command::AppendEntries");
+						};
+					}
+				}
+
+			}
 		}
 	}
 }
