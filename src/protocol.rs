@@ -2,6 +2,9 @@
 
 use std::cmp::PartialEq;
 use std::collections::HashMap;
+use std::sync::mpsc::channel;
+use std::time::{Duration, Instant};
+use rand::Rng;
 use tracing::{debug, trace};
 use crate::network::{Channel, Connection, NetworkNode};
 
@@ -25,7 +28,8 @@ pub enum Command {
 	
 	// TODO: add other useful control messages
 	RequestVote { src: usize, term: usize, log_term: usize, log_length: usize },
-	AppendEntries {}
+	AppendEntries {},
+	Vote {}
 }
 
 // TODO: add other useful structures and implementations
@@ -33,10 +37,12 @@ pub struct Actor {
 	pub node: NetworkNode<Command>,
 	state: ActorState,
 	current_term: usize,
+	timeout: Instant,
 	votes: usize,
+	vote_log: HashMap<usize, usize>, // term, node.address
 	log: Vec<(usize, Command)>,
 	// we use not Channel<Command>, but <Connection<Command>. Seems like Channel.send() shouldn't be used for sending
-	pub connections: Vec<Connection<Command>>,
+	pub connections: HashMap<usize,Connection<Command>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -52,14 +58,21 @@ impl Actor {
 			node,
 			state: ActorState::Follower, // starts always with Follower
 			current_term: 0,
+			timeout: Instant::now(),
 			votes: 0,
+			vote_log: HashMap::new(),
 			log: Vec::new(),
-			connections: Vec::new(),
+			connections: HashMap::new(),
 		}
 	}
 
 
 	pub fn main_loop(&mut self) {
+		const HEARTBEAT: Duration = Duration::from_millis(100);
+		// Timeouts typically 100-300ms (from slides)
+		let election_timeout: Duration = Duration::from_millis(rand::thread_rng().gen_range(100..300));
+		self.timeout = Instant::now() + election_timeout;
+
 		loop {
 			while let Ok(cmd) = self.node.decode(None) {
 				match cmd {
@@ -99,12 +112,46 @@ impl Actor {
 					// control messages
 					Command::Accept(channel) => {
 						trace!(origin = channel.address, "accepted connection");
-						self.connections.push(self.node.accept(channel));
+						self.connections.insert(channel.address, self.node.accept(channel));
 					}
 
 					// Start the Vote
 					Command::RequestVote { src, term, log_term, log_length} => {
-						debug!(src, term, log_term, log_length, "request to start the vote");
+						trace!(src, term, log_term, log_length, "request to start the vote");
+
+						// check if I already voted for this term
+						if let Some(voted_for) = self.vote_log.get(&src) {
+							trace!(term, voted_for, "Already voted for this term");
+							continue;
+						}
+						// accept term better than mine (if I current_term == term, it's means, I already voted for myself)
+						if self.current_term < term {
+							// accept log data equal or better than mine
+							if self.log.last().map(|&(term, _)| term).unwrap_or(0) <= log_term
+								&& self.log.len() <= log_length {
+								// Send vote
+								if let Some(connection) = self.connections.get(&src) {
+									if connection.encode(Command::Vote {}).is_ok() {
+										trace!(src, term, "Send vote");
+										self.vote_log.insert(term, src);
+										self.state = ActorState::Follower;
+										self.current_term = term;
+										self.timeout = Instant::now() + election_timeout;
+									} else {
+										trace!(src, term, "Failed to send vote");
+									}
+								}
+							}
+						}
+					}
+
+					// Send vote
+					Command::Vote {} => {
+						self.votes += 1;
+						if self.votes >= self.connections.len() / 2 {
+							debug!(self.node.address, self.current_term, "Elected leader");
+							self.state = ActorState::Leader;
+						}
 					}
 					_ => {}
 				}
@@ -124,11 +171,18 @@ impl Actor {
 						- Increment term, start new election
 				*/
 				if self.state != ActorState::Leader {
+					if Instant::now() <= self.timeout {
+						continue;
+					}
+
+					self.timeout = Instant::now() + election_timeout;
 					self.current_term += 1;
 					self.state = ActorState::Candidate;
 					self.votes += 1;
+					//voted for myself -> write to log
+					self.vote_log.insert(self.current_term, self.node.address);
 
-					for connection in &self.connections {
+					for connection in self.connections.values() {
 						if connection.encode(Command::RequestVote {
 							src: self.node.address,
 							term: self.current_term,
@@ -143,8 +197,13 @@ impl Actor {
 				}
 
 				if self.state == ActorState::Leader {
+					if Instant::now() <= self.timeout {
+						continue;
+					}
+
+					self.timeout = Instant::now() + HEARTBEAT;
 					// Send AppendEntries heartbeats to all other servers
-					for connection in &self.connections {
+					for connection in self.connections.values() {
 						if connection.encode(Command::AppendEntries {
 						}).is_ok() {
 							trace!(?connection, "Command::AppendEntries sent successfully");
