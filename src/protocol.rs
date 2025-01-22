@@ -28,7 +28,7 @@ pub enum Command {
 	
 	// TODO: add other useful control messages
 	RequestVote { src: usize, term: usize, log_term: usize, log_length: usize },
-	AppendEntries {},
+	AppendEntries { src: usize, term: usize, log_item: Option<Box<LogItem>> },
 	Vote {}
 }
 
@@ -43,6 +43,7 @@ pub struct Actor {
 	log: Vec<(usize, Command)>,
 	// we use not Channel<Command>, but <Connection<Command>. Seems like Channel.send() shouldn't be used for sending
 	pub connections: HashMap<usize,Connection<Command>>,
+	current_leader: Option<usize>
 }
 
 #[derive(Debug, PartialEq)]
@@ -50,6 +51,13 @@ enum ActorState {
 	Leader,
 	Follower,
 	Candidate,
+}
+
+#[derive(Debug)]
+struct LogItem {
+	index: usize,
+	previous_term: usize,
+	command: Option<Command>,
 }
 
 impl Actor {
@@ -63,6 +71,7 @@ impl Actor {
 			vote_log: HashMap::new(),
 			log: Vec::new(),
 			connections: HashMap::new(),
+			current_leader: None
 		}
 	}
 
@@ -70,8 +79,11 @@ impl Actor {
 	pub fn main_loop(&mut self) {
 		const HEARTBEAT: Duration = Duration::from_millis(100);
 		// Timeouts typically 100-300ms (from slides)
-		let election_timeout: Duration = Duration::from_millis(rand::thread_rng().gen_range(100..300));
+		let range = rand::thread_rng().gen_range(100..300);
+		// println!("address:{} range:{}", self.node.address, range);
+		let election_timeout: Duration = Duration::from_millis(range);
 		self.timeout = Instant::now() + election_timeout;
+		// println!("address:{} timeout:{:?}", self.node.address, self.timeout);
 
 		loop {
 			while let Ok(cmd) = self.node.decode(None) {
@@ -136,7 +148,8 @@ impl Actor {
 										self.vote_log.insert(term, src);
 										self.state = ActorState::Follower;
 										self.current_term = term;
-										self.timeout = Instant::now() + election_timeout;
+										// take some more time for actor to be elected (?) Maybe delete after
+										self.timeout = Instant::now() + election_timeout + Duration::from_millis(1000);
 									} else {
 										trace!(src, term, "Failed to send vote");
 									}
@@ -151,6 +164,28 @@ impl Actor {
 						if self.votes >= self.connections.len() / 2 {
 							debug!(self.node.address, self.current_term, "Elected leader");
 							self.state = ActorState::Leader;
+							self.votes = 0;
+						}
+					}
+
+					// heartbeats or add log items
+					Command::AppendEntries { src, term, log_item } => {
+						debug!(src, term, ?log_item, "request to append entries");
+
+						self.state = ActorState::Follower;
+						self.current_term = term;
+						self.current_leader = Some(src);
+
+						match log_item {
+							Some(item) => {
+								// Add log item to log
+								println!("Value is: {:?}", item);
+							}
+							None => {
+								println!("Value is: None");
+								// Just heartbeat, update election timeout
+								self.timeout = Instant::now() + election_timeout;
+							}
 						}
 					}
 					_ => {}
@@ -202,9 +237,12 @@ impl Actor {
 					}
 
 					self.timeout = Instant::now() + HEARTBEAT;
-					// Send AppendEntries heartbeats to all other servers
+					// Send AppendEntries heartbeats (Empty) to all other servers
 					for connection in self.connections.values() {
 						if connection.encode(Command::AppendEntries {
+							src: self.node.address,
+							term: self.current_term,
+							log_item: None,
 						}).is_ok() {
 							trace!(?connection, "Command::AppendEntries sent successfully");
 						} else {
