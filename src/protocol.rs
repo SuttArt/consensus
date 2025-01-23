@@ -9,7 +9,7 @@ use tracing::{debug, trace};
 use crate::network::{Channel, Connection, NetworkNode};
 
 /// Message-type of the network protocol.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Command {
 	/// Open an account with a unique name.
 	Open { account: String },
@@ -29,7 +29,8 @@ pub enum Command {
 	// TODO: add other useful control messages
 	RequestVote { src: usize, term: usize, log_term: usize, log_length: usize },
 	AppendEntries { src: usize, term: usize, log_item: Option<Box<LogItem>> },
-	Vote {}
+	Vote {},
+	AppendCommand (Box<Command>)
 }
 
 // TODO: add other useful structures and implementations
@@ -41,6 +42,7 @@ pub struct Actor {
 	votes: usize,
 	vote_log: HashMap<usize, usize>, // term, node.address
 	log: Vec<(usize, Command)>,
+	tmp_log: Vec<Command>,
 	// we use not Channel<Command>, but <Connection<Command>. Seems like Channel.send() shouldn't be used for sending
 	pub connections: HashMap<usize,Connection<Command>>,
 	current_leader: Option<usize>
@@ -53,11 +55,12 @@ enum ActorState {
 	Candidate,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LogItem {
 	index: usize,
 	previous_term: usize,
 	command: Option<Command>,
+	commited: bool,
 }
 
 impl Actor {
@@ -70,6 +73,7 @@ impl Actor {
 			votes: 0,
 			vote_log: HashMap::new(),
 			log: Vec::new(),
+			tmp_log: Vec::new(),
 			connections: HashMap::new(),
 			current_leader: None
 		}
@@ -91,18 +95,14 @@ impl Actor {
 					// customer requests
 					Command::Open { account } => {
 						debug!("request to open an account for {:?}", account);
-
-						// connect to leader
-						// write to local log
-						// duplicate to another actors
-						// commit log item
-						// write to log
+						self.process_command(Command::Open { account: account.clone() });
 
 						// cannot be undone, proof, if everything okay
 						self.node.append(&Command::Open { account })
 					}
 					Command::Deposit { account, amount } => {
 						debug!(amount, ?account, "request to deposit");
+						self.process_command(Command::Deposit { account: account.clone(), amount: amount.clone() });
 
 						// cannot be undone, proof, if everything okay
 						self.node.append(&Command::Deposit { account, amount })
@@ -110,12 +110,14 @@ impl Actor {
 					}
 					Command::Withdraw { account, amount } => {
 						debug!(amount, ?account, "request to withdraw");
+						self.process_command(Command::Withdraw { account: account.clone(), amount: amount.clone() });
 
 						// cannot be undone, proof, if everything okay
 						self.node.append(&Command::Withdraw { account, amount })
 					}
 					Command::Transfer { src, dst, amount } => {
 						debug!(amount, ?src, ?dst, "request to transfer");
+						self.process_command(Command::Transfer { src: src.clone(), dst: dst.clone(), amount: amount.clone() });
 
 						// cannot be undone, proof, if everything okay
 						self.node.append(&Command::Transfer { src, dst, amount })
@@ -148,8 +150,7 @@ impl Actor {
 										self.vote_log.insert(term, src);
 										self.state = ActorState::Follower;
 										self.current_term = term;
-										// take some more time for actor to be elected (?) Maybe delete after
-										self.timeout = Instant::now() + election_timeout + Duration::from_millis(1000);
+										self.timeout = Instant::now() + election_timeout
 									} else {
 										trace!(src, term, "Failed to send vote");
 									}
@@ -165,27 +166,33 @@ impl Actor {
 							debug!(self.node.address, self.current_term, "Elected leader");
 							self.state = ActorState::Leader;
 							self.votes = 0;
+							self.current_leader = None;
+							self.timeout = Instant::now() // send immediately Heartbeat
 						}
 					}
 
 					// heartbeats or add log items
 					Command::AppendEntries { src, term, log_item } => {
-						debug!(src, term, ?log_item, "request to append entries");
+						// Sometimes it sends data from previous term
+						if self.current_term <= term || self.state == ActorState::Candidate {
+							trace!(src, term, ?log_item, "request to append entries");
 
-						self.state = ActorState::Follower;
-						self.current_term = term;
-						self.current_leader = Some(src);
+							self.state = ActorState::Follower;
+							self.current_term = term;
+							self.current_leader = Some(src);
 
-						match log_item {
-							Some(item) => {
-								// Add log item to log
-								println!("Value is: {:?}", item);
+							match log_item {
+								Some(item) => {
+									// Add log item to log
+									println!("Value is: {:?}", item);
+								}
+								None => {
+									// Just heartbeat, update election timeout
+									self.timeout = Instant::now() + election_timeout;
+								}
 							}
-							None => {
-								println!("Value is: None");
-								// Just heartbeat, update election timeout
-								self.timeout = Instant::now() + election_timeout;
-							}
+						} else {
+							continue;
 						}
 					}
 					_ => {}
@@ -253,6 +260,110 @@ impl Actor {
 
 			}
 		}
+	}
+
+	fn process_command(&mut self, command: Command) {
+		/*
+		Normal Operation
+
+		Client sends command to leader;
+		Leader appends command to its log;
+		Leader sends AppendEntries RPCs to followers;
+		Once new entry committed:
+			Leader passes command to its state machine, returns result to client.
+			Leader notifies followers of committed entries in subsequent AppendEntries RPCs.
+			Followers pass committed commands to their state machines.
+		Crashed/slow followers?
+			Leader retries RPCs until they succeed.
+		Performance is optimal in common case:
+			One successful RPC to any majority of servers.
+		 */
+
+		match self.current_leader {
+			Some(leader) => {
+				// Add log item to log
+				if let Some(leader) = self.connections.get(&leader) {
+					if leader.encode(Command::AppendCommand(Box::new(command.clone()))).is_ok() {
+						trace!(?command, ?self.current_leader, "AppendCommand sent successfully");
+					} else {
+						trace!(?command, ?self.current_leader, "Failed to send AppendCommand, push to tmp log.");
+						self.tmp_log.push(command);
+					}
+				}
+
+			}
+			None => {
+				trace!(?command, "No current leader, push to tmp log.");
+				// Store to tmp_log and process them later
+				self.tmp_log.push(command);
+			}
+		}
+	}
+}
+
+
+struct DB {
+	/// Stores account balances keyed by account names.
+	account: HashMap<String, usize>,
+}
+
+impl DB {
+	/// Creates a new, empty database of accounts.
+	pub fn new() -> Self {
+		DB {
+			account: HashMap::new(),
+		}
+	}
+
+	/// Opens a new account with a unique name.
+	fn open_account(&mut self, account: &str) {
+		self.account.entry(account.to_string()).or_insert(0);
+	}
+
+	/// Attempts to check if an account can be opened, returning `true` if it can, or `false` if the account already exists.
+	fn try_open_account(&self, account: &str) -> bool {
+		!self.account.contains_key(account)
+	}
+
+	/// Deposits money into an account.
+	fn deposit_money(&mut self, account: &str, amount: usize) {
+		if let Some(balance) = self.account.get_mut(account) {
+			*balance += amount;
+		}
+	}
+
+	/// Attempts to check if money can be deposited into an account, returning `true` if possible, or `false` if the account does not exist.
+	fn try_deposit_money(&self, account: &str) -> bool {
+		!self.try_open_account(account)
+	}
+
+	/// Withdraws money from an account.
+	fn withdraw_money(&mut self, account: &str, amount: usize) {
+		if let Some(balance) = self.account.get_mut(account) {
+			if *balance >= amount {
+				*balance -= amount;
+			}
+		}
+	}
+
+	/// Attempts to check if money can be withdrawn from an account, returning `true` if possible, or `false` if the account does not exist or has insufficient funds.
+	fn try_withdraw_money(&self, account: &str, amount: usize) -> bool {
+		self.account.get(account).map_or(false, |balance| *balance >= amount)
+	}
+
+	/// Transfers money between two accounts.
+	fn transfer_money(&mut self, src: &str, dst: &str, amount: usize) {
+		if self.try_withdraw_money(src, amount) && self.account.contains_key(dst) {
+			let src_new_balance = self.account[src] - amount;
+			let dst_new_balance = self.account[dst] + amount;
+			self.account.insert(src.to_string(), src_new_balance);
+			self.account.insert(dst.to_string(), dst_new_balance);
+		}
+	}
+
+	/// Attempts to check if money can be transferred between two accounts, returning `true` if possible, or `false` otherwise.
+	fn try_transfer_money(&self, src: &str, dst: &str, amount: usize) -> bool {
+		self.try_withdraw_money(src, amount) && self.account.contains_key(dst)
 	}
 }
 

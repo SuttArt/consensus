@@ -54,7 +54,7 @@ fn main() -> io::Result<()> {
 	// initialize the tracer
 	FmtSubscriber::builder()
 		.with_timer(ChronoLocal::new("[%Mm %Ss]".to_string()))
-		.with_max_level(Level::DEBUG)
+		.with_max_level(Level::TRACE)
 		.init();
 	
 	// create and connect a number of offices
