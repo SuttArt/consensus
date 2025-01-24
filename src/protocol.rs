@@ -2,7 +2,6 @@
 
 use std::cmp::PartialEq;
 use std::collections::HashMap;
-use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 use rand::Rng;
 use tracing::{debug, trace};
@@ -30,7 +29,8 @@ pub enum Command {
 	RequestVote { src: usize, term: usize, log_term: usize, log_length: usize },
 	AppendEntries { src: usize, term: usize, log_item: Option<Box<LogItem>> },
 	Vote {},
-	AppendCommand (Box<Command>)
+	AppendCommand (Box<Command>),
+	Response { src: usize, term: usize, index: usize, confirmation: bool },
 }
 
 // TODO: add other useful structures and implementations
@@ -45,7 +45,11 @@ pub struct Actor {
 	tmp_log: Vec<Command>,
 	// we use not Channel<Command>, but <Connection<Command>. Seems like Channel.send() shouldn't be used for sending
 	pub connections: HashMap<usize,Connection<Command>>,
-	current_leader: Option<usize>
+	// For Repairing Follower Logs, Leader keeps nextIndex for each follower:
+	connections_index: HashMap<usize,usize>, // <Address, nextIndex>
+	current_leader: Option<usize>,
+	// Database struct, to hold Bank state, init in main.rs
+	db: DB,
 }
 
 #[derive(Debug, PartialEq)]
@@ -56,15 +60,15 @@ enum ActorState {
 }
 
 #[derive(Debug, Clone)]
-struct LogItem {
+pub struct LogItem {
 	index: usize,
 	previous_term: usize,
-	command: Option<Command>,
-	commited: bool,
+	current_term: usize,
+	command: Command,
 }
 
 impl Actor {
-	pub fn new(node: NetworkNode<Command>) -> Self {
+	pub fn new(node: NetworkNode<Command>, db: DB) -> Self {
 		Actor {
 			node,
 			state: ActorState::Follower, // starts always with Follower
@@ -75,7 +79,9 @@ impl Actor {
 			log: Vec::new(),
 			tmp_log: Vec::new(),
 			connections: HashMap::new(),
-			current_leader: None
+			connections_index: HashMap::new(),
+			current_leader: None,
+			db
 		}
 	}
 
@@ -126,7 +132,8 @@ impl Actor {
 					// control messages
 					Command::Accept(channel) => {
 						trace!(origin = channel.address, "accepted connection");
-						self.connections.insert(channel.address, self.node.accept(channel));
+						self.connections.insert(channel.address, self.node.accept(channel.clone()));
+						self.connections_index.insert(channel.address, 0);
 					}
 
 					// Start the Vote
@@ -184,18 +191,120 @@ impl Actor {
 							match log_item {
 								Some(item) => {
 									// Add log item to log
-									println!("Value is: {:?}", item);
+									// AppendEntries Consistency Check
+									// Repairing Follower Logs
+									let mut confirmation = false;
+
+									if let Some(follower_item) = self.create_log_item_follower(item.index) {
+										// if follower item term in log == term of prev. item in leader log, then ok
+										if follower_item.current_term == item.previous_term {
+											// if follower item index in log == prev. item index in leader log, then ok
+											if follower_item.index == item.index - 1 {
+												confirmation = true;
+											}
+										}
+									} else {
+										if self.log.is_empty() {
+											confirmation = true;
+										}
+									}
+
+									// Send Response
+									if let Some(connection) = self.connections.get(&src) {
+										if connection.encode(Command::Response {
+											src: self.node.address,
+											term,
+											index: item.index,
+											confirmation,
+										}).is_ok() && confirmation {
+											self.log.truncate(item.index);
+											self.log.push((term, item.command));
+											trace!(?self.log, "Updated Log.");
+										} else {
+											trace!(src, term, "Failed to send response.");
+										}
+									}
+
+									self.timeout = Instant::now() + election_timeout;
 								}
 								None => {
 									// Just heartbeat, update election timeout
 									self.timeout = Instant::now() + election_timeout;
+
+									// check if tmp_log hase some items -> push to the leader to process them
+									if !self.tmp_log.is_empty() {
+										let commands: Vec<_> = self.tmp_log.drain(..).collect();
+										for cmd in commands {
+											self.process_command(cmd);
+										}
+									}
 								}
 							}
 						} else {
 							continue;
 						}
 					}
-					_ => {}
+
+					// Check if Clients Commands could be executed, if yes - send to followers. No - reject
+					Command::AppendCommand(command) => {
+						if self.state == ActorState::Leader {
+							// check if you can do this command
+							let permission =  self.is_possible_to_do(*command.clone());
+
+							if permission {
+								debug!(self.node.address, self.current_term, ?command, "Command written into log");
+								self.log.push((self.current_term, *command));
+								// Send to followers
+								let log_item = Some(Box::new(self.create_log_item(self.log.len() - 1)));
+								for connection in self.connections.values_mut() {
+									if connection.encode(Command::AppendEntries {
+										src: self.node.address,
+										term: self.current_term,
+										log_item: log_item.clone(),
+									}).is_ok() {
+										trace!(?connection, "Command::AppendEntries sent successfully");
+									} else {
+										trace!(?connection, "Failed to send command Command::AppendEntries");
+									};
+								}
+							} else {
+								debug!(self.node.address, self.current_term, ?command, "Command rejected");
+							}
+						} else {
+							// If somehow not leader -> store it in tmp_log and try later
+							self.tmp_log.push(*command);
+						}
+					}
+
+					// Respond from Followers to leader, after asking append Entries to the log
+					Command::Response { src, term, index, confirmation } => {
+						if self.state == ActorState::Leader && self.current_term == term {
+							if confirmation {
+
+							} else {
+								// Send to follower to restore log
+								let next_index = if self.log.len() == 0 || index == 0 {
+									0
+								} else {
+									index - 1
+								};
+
+								let log_item = Some(Box::new(self.create_log_item(next_index)));
+
+								if let Some(connection) = self.connections.get(&src) {
+									if connection.encode(Command::AppendEntries {
+										src: self.node.address,
+										term,
+										log_item: log_item.clone(),
+									}).is_ok() {
+										trace!(?connection, "Command::AppendEntries sent successfully");
+									} else {
+										trace!(?connection, "Failed to send command Command::AppendEntries");
+									};
+								}
+							}
+						}
+					}
 				}
 
 				/*
@@ -251,9 +360,9 @@ impl Actor {
 							term: self.current_term,
 							log_item: None,
 						}).is_ok() {
-							trace!(?connection, "Command::AppendEntries sent successfully");
+							trace!(?connection, "Heartbeat sent successfully");
 						} else {
-							trace!(?connection, "Failed to send command Command::AppendEntries");
+							trace!(?connection, "Failed to send Heartbeat");
 						};
 					}
 				}
@@ -299,10 +408,52 @@ impl Actor {
 			}
 		}
 	}
+	fn is_possible_to_do(&self, command: Command) -> bool {
+		match command {
+			Command::Open { account } => self.db.try_open_account(&account),
+			Command::Deposit { account, amount } => self.db.try_deposit_money(&account, amount),
+			Command::Withdraw { account, amount } => self.db.try_withdraw_money(&account, amount),
+			Command::Transfer { src, dst, amount } => self.db.try_transfer_money(&src, &dst, amount),
+			_ => {false}
+		}
+	}
+
+	fn create_log_item(&mut self, index: usize) -> LogItem {
+		// Get the term of the previous entry, or 0 if out of bounds
+		let previous_term = if index < self.log.len() && index > 0 {
+			self.log.get(index - 1).map(|&(term, _)| term).unwrap_or(0)
+		} else {
+			0
+		};
+
+		LogItem {
+			index,
+			previous_term,
+			current_term: self.log[index].0.clone(),
+			command: self.log[index].1.clone(),
+		}
+	}
+
+	// Code duplication, do not have much time to fix create_log_item
+	fn create_log_item_follower(&mut self, index: usize) -> Option<LogItem> {
+		if index < self.log.len() && index > 0 {
+			let previous_term = self.log.get(index - 1).map(|&(term, _)| term).unwrap_or(0);
+
+			Some(LogItem {
+				index,
+				previous_term,
+				current_term: self.log[index].0.clone(),
+				command: self.log[index].1.clone(),
+			})
+		} else {
+			None
+		}
+	}
 }
 
 
-struct DB {
+#[derive(Debug, Clone)]
+pub struct DB {
 	/// Stores account balances keyed by account names.
 	account: HashMap<String, usize>,
 }
@@ -333,7 +484,7 @@ impl DB {
 	}
 
 	/// Attempts to check if money can be deposited into an account, returning `true` if possible, or `false` if the account does not exist.
-	fn try_deposit_money(&self, account: &str) -> bool {
+	fn try_deposit_money(&self, account: &str, _amount: usize) -> bool {
 		!self.try_open_account(account)
 	}
 

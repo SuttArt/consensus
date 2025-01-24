@@ -7,7 +7,7 @@ use rand::prelude::*;
 use tracing::{debug, info, Level, trace, trace_span};
 
 use network::{Channel, daemon, NetworkNode};
-use protocol::{Command, Actor};
+use protocol::{Command, Actor, DB};
 
 pub mod network;
 pub mod protocol;
@@ -18,13 +18,13 @@ pub fn setup_offices(office_count: usize, log_path: &str) -> io::Result<Vec<Chan
 	
 	// create the log directory if needed
 	fs::create_dir_all(log_path)?;
-	
+	let db = DB::new();
 	// create various network nodes and start them
 	for address in 0..office_count {
 		let node = NetworkNode::new(address, &log_path)?;
 		channels.push(node.channel());
 
-		let mut actor = Actor::new(node);
+		let mut actor = Actor::new(node, db.clone());
 		
 		thread::spawn(move || {
 			// configure a span to associate log-entries with this network node
@@ -54,7 +54,7 @@ fn main() -> io::Result<()> {
 	// initialize the tracer
 	FmtSubscriber::builder()
 		.with_timer(ChronoLocal::new("[%Mm %Ss]".to_string()))
-		.with_max_level(Level::TRACE)
+		.with_max_level(Level::DEBUG)
 		.init();
 	
 	// create and connect a number of offices
@@ -72,6 +72,7 @@ fn main() -> io::Result<()> {
 		// customer requests start with the branch office index,
 		// followed by the source account name and a list of requests
 		[0] "Weber"   => open(), deposit( 50);
+		[5] "Weber"   => open(), deposit( 50);
 		[1] "Redlich" => open(), deposit(100);
 		sleep();
 		[2] "Redlich" => transfer("Weber", 20);
