@@ -40,16 +40,17 @@ pub struct Actor {
 	current_term: usize,
 	timeout: Instant,
 	votes: usize,
-	vote_log: HashMap<usize, usize>, // term, node.address
+	vote_log: HashMap<usize, usize>, // node.address,  term
 	log: Vec<(usize, Command)>,
 	tmp_log: Vec<Command>,
 	// we use not Channel<Command>, but <Connection<Command>. Seems like Channel.send() shouldn't be used for sending
 	pub connections: HashMap<usize,Connection<Command>>,
 	// For Repairing Follower Logs, Leader keeps nextIndex for each follower:
-	connections_index: HashMap<usize,usize>, // <Address, nextIndex>
+	connections_index: HashMap<usize,Option<usize>>, // <Address, nextIndex>
 	current_leader: Option<usize>,
 	// Database struct, to hold Bank state, init in main.rs
 	db: DB,
+	commit_index: Option<usize>
 }
 
 #[derive(Debug, PartialEq)]
@@ -81,7 +82,8 @@ impl Actor {
 			connections: HashMap::new(),
 			connections_index: HashMap::new(),
 			current_leader: None,
-			db
+			db,
+			commit_index: None
 		}
 	}
 
@@ -96,44 +98,32 @@ impl Actor {
 		// println!("address:{} timeout:{:?}", self.node.address, self.timeout);
 
 		loop {
-			while let Ok(cmd) = self.node.decode(None) {
+			while let Ok(cmd) = self.node.decode(Some(self.timeout)) {
 				match cmd {
 					// customer requests
 					Command::Open { account } => {
-						debug!("request to open an account for {:?}", account);
+						trace!("request to open an account for {:?}", account);
 						self.process_command(Command::Open { account: account.clone() });
-
-						// cannot be undone, proof, if everything okay
-						self.node.append(&Command::Open { account })
 					}
 					Command::Deposit { account, amount } => {
-						debug!(amount, ?account, "request to deposit");
+						trace!(amount, ?account, "request to deposit");
 						self.process_command(Command::Deposit { account: account.clone(), amount: amount.clone() });
-
-						// cannot be undone, proof, if everything okay
-						self.node.append(&Command::Deposit { account, amount })
 
 					}
 					Command::Withdraw { account, amount } => {
-						debug!(amount, ?account, "request to withdraw");
+						trace!(amount, ?account, "request to withdraw");
 						self.process_command(Command::Withdraw { account: account.clone(), amount: amount.clone() });
-
-						// cannot be undone, proof, if everything okay
-						self.node.append(&Command::Withdraw { account, amount })
 					}
 					Command::Transfer { src, dst, amount } => {
-						debug!(amount, ?src, ?dst, "request to transfer");
+						trace!(amount, ?src, ?dst, "request to transfer");
 						self.process_command(Command::Transfer { src: src.clone(), dst: dst.clone(), amount: amount.clone() });
-
-						// cannot be undone, proof, if everything okay
-						self.node.append(&Command::Transfer { src, dst, amount })
 					}
 
 					// control messages
 					Command::Accept(channel) => {
 						trace!(origin = channel.address, "accepted connection");
 						self.connections.insert(channel.address, self.node.accept(channel.clone()));
-						self.connections_index.insert(channel.address, 0);
+						self.connections_index.insert(channel.address, None);
 					}
 
 					// Start the Vote
@@ -141,7 +131,7 @@ impl Actor {
 						trace!(src, term, log_term, log_length, "request to start the vote");
 
 						// check if I already voted for this term
-						if let Some(voted_for) = self.vote_log.get(&src) {
+						if let Some(voted_for) = self.vote_log.get(&term) {
 							trace!(term, voted_for, "Already voted for this term");
 							continue;
 						}
@@ -150,14 +140,15 @@ impl Actor {
 							// accept log data equal or better than mine
 							if self.log.last().map(|&(term, _)| term).unwrap_or(0) <= log_term
 								&& self.log.len() <= log_length {
+								self.vote_log.insert(term, src);
+								self.state = ActorState::Follower;
+								self.current_term = term;
+								self.timeout = Instant::now() + election_timeout;
+
 								// Send vote
 								if let Some(connection) = self.connections.get(&src) {
 									if connection.encode(Command::Vote {}).is_ok() {
 										trace!(src, term, "Send vote");
-										self.vote_log.insert(term, src);
-										self.state = ActorState::Follower;
-										self.current_term = term;
-										self.timeout = Instant::now() + election_timeout
 									} else {
 										trace!(src, term, "Failed to send vote");
 									}
@@ -169,7 +160,7 @@ impl Actor {
 					// Send vote
 					Command::Vote {} => {
 						self.votes += 1;
-						if self.votes >= self.connections.len() / 2 {
+						if self.votes >= self.connections.len() + 1 / 2 {
 							debug!(self.node.address, self.current_term, "Elected leader");
 							self.state = ActorState::Leader;
 							self.votes = 0;
@@ -252,7 +243,7 @@ impl Actor {
 							let permission =  self.is_possible_to_do(*command.clone());
 
 							if permission {
-								debug!(self.node.address, self.current_term, ?command, "Command written into log");
+								trace!(self.node.address, self.current_term, ?command, "Command written into log");
 								self.log.push((self.current_term, *command));
 								// Send to followers
 								let log_item = Some(Box::new(self.create_log_item(self.log.len() - 1)));
@@ -268,7 +259,7 @@ impl Actor {
 									};
 								}
 							} else {
-								debug!(self.node.address, self.current_term, ?command, "Command rejected");
+								trace!(self.node.address, self.current_term, ?command, "Command rejected");
 							}
 						} else {
 							// If somehow not leader -> store it in tmp_log and try later
@@ -280,7 +271,6 @@ impl Actor {
 					Command::Response { src, term, index, confirmation } => {
 						if self.state == ActorState::Leader && self.current_term == term {
 							if confirmation {
-
 							} else {
 								// Send to follower to restore log
 								let next_index = if self.log.len() == 0 || index == 0 {
@@ -306,67 +296,66 @@ impl Actor {
 						}
 					}
 				}
+			}
 
-				/*
-				Election Basics
-				Increment current term
-				Change to Candidate state
-				Vote for self
-				Send RequestVote RPCs to all other servers, retry until either:
-					1. Receive votes from the majority of servers:
-						- Become leader
-						- Send AppendEntries heartbeats to all other servers
-					2. Receive RPC from valid leader:
-						- Return to follower state
-					3. No-one wins election (election timeout elapses):
-						- Increment term, start new election
-				*/
-				if self.state != ActorState::Leader {
-					if Instant::now() <= self.timeout {
-						continue;
-					}
-
-					self.timeout = Instant::now() + election_timeout;
-					self.current_term += 1;
-					self.state = ActorState::Candidate;
-					self.votes += 1;
-					//voted for myself -> write to log
-					self.vote_log.insert(self.current_term, self.node.address);
-
-					for connection in self.connections.values() {
-						if connection.encode(Command::RequestVote {
-							src: self.node.address,
-							term: self.current_term,
-							log_term: self.log.last().map(|&(term, _)| term).unwrap_or(0),
-							log_length: self.log.len(),
-						}).is_ok() {
-							trace!(?connection, "Command::RequestVote sent successfully");
-						} else {
-							trace!(?connection, "Failed to send command Command::RequestVote");
-						};
-					}
+			/*
+Election Basics
+Increment current term
+Change to Candidate state
+Vote for self
+Send RequestVote RPCs to all other servers, retry until either:
+    1. Receive votes from the majority of servers:
+        - Become leader
+        - Send AppendEntries heartbeats to all other servers
+    2. Receive RPC from valid leader:
+        - Return to follower state
+    3. No-one wins election (election timeout elapses):
+        - Increment term, start new election
+*/
+			if self.state != ActorState::Leader {
+				if Instant::now() <= self.timeout {
+					continue;
 				}
 
-				if self.state == ActorState::Leader {
-					if Instant::now() <= self.timeout {
-						continue;
-					}
+				self.timeout = Instant::now() + election_timeout;
+				self.current_term += 1;
+				self.state = ActorState::Candidate;
+				self.votes += 1;
+				//voted for myself -> write to log
+				self.vote_log.insert(self.node.address, self.current_term);
 
-					self.timeout = Instant::now() + HEARTBEAT;
-					// Send AppendEntries heartbeats (Empty) to all other servers
-					for connection in self.connections.values() {
-						if connection.encode(Command::AppendEntries {
-							src: self.node.address,
-							term: self.current_term,
-							log_item: None,
-						}).is_ok() {
-							trace!(?connection, "Heartbeat sent successfully");
-						} else {
-							trace!(?connection, "Failed to send Heartbeat");
-						};
-					}
+				for connection in self.connections.values() {
+					if connection.encode(Command::RequestVote {
+						src: self.node.address,
+						term: self.current_term,
+						log_term: self.log.last().map(|&(term, _)| term).unwrap_or(0),
+						log_length: self.log.len(),
+					}).is_ok() {
+						trace!(?connection, "Command::RequestVote sent successfully");
+					} else {
+						trace!(?connection, "Failed to send command Command::RequestVote");
+					};
+				}
+			}
+
+			if self.state == ActorState::Leader {
+				if Instant::now() <= self.timeout {
+					continue;
 				}
 
+				self.timeout = Instant::now() + HEARTBEAT;
+				// Send AppendEntries heartbeats (Empty) to all other servers
+				for connection in self.connections.values() {
+					if connection.encode(Command::AppendEntries {
+						src: self.node.address,
+						term: self.current_term,
+						log_item: None,
+					}).is_ok() {
+						trace!(?connection, "Heartbeat sent successfully");
+					} else {
+						trace!(?connection, "Failed to send Heartbeat");
+					};
+				}
 			}
 		}
 	}

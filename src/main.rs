@@ -4,8 +4,7 @@ use std::{env::args, fs, io, thread};
 
 use rand::prelude::*;
 #[allow(unused_imports)]
-use tracing::{debug, info, Level, trace, trace_span};
-
+use tracing::{debug, info, Level, trace, trace_span, debug_span};
 use network::{Channel, daemon, NetworkNode};
 use protocol::{Command, Actor, DB};
 
@@ -28,7 +27,7 @@ pub fn setup_offices(office_count: usize, log_path: &str) -> io::Result<Vec<Chan
 		
 		thread::spawn(move || {
 			// configure a span to associate log-entries with this network node
-			let _guard = trace_span!("NetworkNode", id = actor.node.address);
+			let _guard = debug_span!("NetworkNode", id = actor.node.address);
 			let _guard = _guard.enter();
 
 			actor.main_loop();
