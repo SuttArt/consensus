@@ -165,7 +165,15 @@ impl Actor {
 							self.state = ActorState::Leader;
 							self.votes = 0;
 							self.current_leader = None;
-							self.timeout = Instant::now() // send immediately Heartbeat
+							self.timeout = Instant::now(); // send immediately Heartbeat
+
+							// check if you have something in your tmp_log
+							if !self.tmp_log.is_empty() {
+								let commands: Vec<_> = self.tmp_log.drain(..).collect();
+								for cmd in commands {
+									self.log.push((self.current_term, cmd));
+								}
+							}
 						}
 					}
 
@@ -178,13 +186,15 @@ impl Actor {
 							self.state = ActorState::Follower;
 							self.current_term = term;
 							self.current_leader = Some(src);
+							// update election timeout
+							self.timeout = Instant::now() + election_timeout;
 
 							match log_item {
 								Some(item) => {
 									// Add log item to log
 									// AppendEntries Consistency Check
 									// Repairing Follower Logs
-									let mut confirmation = false;
+/*									let mut confirmation = false;
 
 									if let Some(follower_item) = self.create_log_item_follower(item.index) {
 										// if follower item term in log == term of prev. item in leader log, then ok
@@ -198,10 +208,10 @@ impl Actor {
 										if self.log.is_empty() {
 											confirmation = true;
 										}
-									}
+									}*/
 
 									// Send Response
-									if let Some(connection) = self.connections.get(&src) {
+/*									if let Some(connection) = self.connections.get(&src) {
 										if connection.encode(Command::Response {
 											src: self.node.address,
 											term,
@@ -214,14 +224,10 @@ impl Actor {
 										} else {
 											trace!(src, term, "Failed to send response.");
 										}
-									}
-
-									self.timeout = Instant::now() + election_timeout;
+									}*/
 								}
 								None => {
-									// Just heartbeat, update election timeout
-									self.timeout = Instant::now() + election_timeout;
-
+									// Just heartbeat
 									// check if tmp_log hase some items -> push to the leader to process them
 									if !self.tmp_log.is_empty() {
 										let commands: Vec<_> = self.tmp_log.drain(..).collect();
@@ -240,14 +246,14 @@ impl Actor {
 					Command::AppendCommand(command) => {
 						if self.state == ActorState::Leader {
 							// check if you can do this command
-							let permission =  self.is_possible_to_do(*command.clone());
+							let permission = true;  //self.is_possible_to_do(*command.clone());
 
 							if permission {
 								trace!(self.node.address, self.current_term, ?command, "Command written into log");
 								self.log.push((self.current_term, *command));
 								// Send to followers
-								let log_item = Some(Box::new(self.create_log_item(self.log.len() - 1)));
-								for connection in self.connections.values_mut() {
+								// let log_item = Some(Box::new(self.create_log_item(self.log.len() - 1)));
+/*								for connection in self.connections.values_mut() {
 									if connection.encode(Command::AppendEntries {
 										src: self.node.address,
 										term: self.current_term,
@@ -257,7 +263,7 @@ impl Actor {
 									} else {
 										trace!(?connection, "Failed to send command Command::AppendEntries");
 									};
-								}
+								}*/
 							} else {
 								trace!(self.node.address, self.current_term, ?command, "Command rejected");
 							}
@@ -342,7 +348,6 @@ Send RequestVote RPCs to all other servers, retry until either:
 				if Instant::now() <= self.timeout {
 					continue;
 				}
-
 				self.timeout = Instant::now() + HEARTBEAT;
 				// Send AppendEntries heartbeats (Empty) to all other servers
 				for connection in self.connections.values() {
@@ -391,9 +396,14 @@ Send RequestVote RPCs to all other servers, retry until either:
 
 			}
 			None => {
-				trace!(?command, "No current leader, push to tmp log.");
-				// Store to tmp_log and process them later
-				self.tmp_log.push(command);
+				// check, maybe you are leader
+				if self.state == ActorState::Leader {
+					self.log.push((self.current_term, command));
+				} else {
+					trace!(?command, "No current leader, push to tmp log.");
+					// Store to tmp_log and process them later
+					self.tmp_log.push(command);
+				}
 			}
 		}
 	}
