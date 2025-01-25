@@ -64,7 +64,6 @@ enum ActorState {
 pub struct LogItem {
 	index: usize,
 	previous_term: usize,
-	current_term: usize,
 	command: Command,
 }
 
@@ -171,7 +170,7 @@ impl Actor {
 							if !self.tmp_log.is_empty() {
 								let commands: Vec<_> = self.tmp_log.drain(..).collect();
 								for cmd in commands {
-									self.log.push((self.current_term, cmd));
+									self.handle_append_command(cmd);
 								}
 							}
 						}
@@ -191,6 +190,7 @@ impl Actor {
 
 							match log_item {
 								Some(item) => {
+									debug!(?item.command);
 									// Add log item to log
 									// AppendEntries Consistency Check
 									// Repairing Follower Logs
@@ -245,28 +245,7 @@ impl Actor {
 					// Check if Clients Commands could be executed, if yes - send to followers. No - reject
 					Command::AppendCommand(command) => {
 						if self.state == ActorState::Leader {
-							// check if you can do this command
-							let permission = true;  //self.is_possible_to_do(*command.clone());
-
-							if permission {
-								trace!(self.node.address, self.current_term, ?command, "Command written into log");
-								self.log.push((self.current_term, *command));
-								// Send to followers
-								// let log_item = Some(Box::new(self.create_log_item(self.log.len() - 1)));
-/*								for connection in self.connections.values_mut() {
-									if connection.encode(Command::AppendEntries {
-										src: self.node.address,
-										term: self.current_term,
-										log_item: log_item.clone(),
-									}).is_ok() {
-										trace!(?connection, "Command::AppendEntries sent successfully");
-									} else {
-										trace!(?connection, "Failed to send command Command::AppendEntries");
-									};
-								}*/
-							} else {
-								trace!(self.node.address, self.current_term, ?command, "Command rejected");
-							}
+							self.handle_append_command(*command);
 						} else {
 							// If somehow not leader -> store it in tmp_log and try later
 							self.tmp_log.push(*command);
@@ -277,6 +256,11 @@ impl Actor {
 					Command::Response { src, term, index, confirmation } => {
 						if self.state == ActorState::Leader && self.current_term == term {
 							if confirmation {
+								// check if you can do this command
+								// let permission = self.is_possible_to_do(*command.clone());
+								// if permission {
+								//
+								// } else { trace!(self.node.address, self.current_term, ?command, "Command rejected"); }
 							} else {
 								// Send to follower to restore log
 								let next_index = if self.log.len() == 0 || index == 0 {
@@ -348,6 +332,7 @@ Send RequestVote RPCs to all other servers, retry until either:
 				if Instant::now() <= self.timeout {
 					continue;
 				}
+				// debug!(?self.log);
 				self.timeout = Instant::now() + HEARTBEAT;
 				// Send AppendEntries heartbeats (Empty) to all other servers
 				for connection in self.connections.values() {
@@ -398,13 +383,32 @@ Send RequestVote RPCs to all other servers, retry until either:
 			None => {
 				// check, maybe you are leader
 				if self.state == ActorState::Leader {
-					self.log.push((self.current_term, command));
+					self.handle_append_command(command);
 				} else {
 					trace!(?command, "No current leader, push to tmp log.");
 					// Store to tmp_log and process them later
 					self.tmp_log.push(command);
 				}
 			}
+		}
+	}
+
+	fn handle_append_command(&mut self, command: Command) {
+		trace!(self.node.address, self.current_term, ?command, "Command written into log");
+		self.log.push((self.current_term, command));
+
+		// Send to followers
+		let log_item = Some(Box::new(self.create_log_item(self.log.len() - 1)));
+		for connection in self.connections.values_mut() {
+			if connection.encode(Command::AppendEntries {
+				src: self.node.address,
+				term: self.current_term,
+				log_item: log_item.clone(),
+			}).is_ok() {
+				trace!(?connection, "Command::AppendEntries sent successfully");
+			} else {
+				trace!(?connection, "Failed to send command Command::AppendEntries");
+			};
 		}
 	}
 	fn is_possible_to_do(&self, command: Command) -> bool {
@@ -428,24 +432,7 @@ Send RequestVote RPCs to all other servers, retry until either:
 		LogItem {
 			index,
 			previous_term,
-			current_term: self.log[index].0.clone(),
 			command: self.log[index].1.clone(),
-		}
-	}
-
-	// Code duplication, do not have much time to fix create_log_item
-	fn create_log_item_follower(&mut self, index: usize) -> Option<LogItem> {
-		if index < self.log.len() && index > 0 {
-			let previous_term = self.log.get(index - 1).map(|&(term, _)| term).unwrap_or(0);
-
-			Some(LogItem {
-				index,
-				previous_term,
-				current_term: self.log[index].0.clone(),
-				command: self.log[index].1.clone(),
-			})
-		} else {
-			None
 		}
 	}
 }
