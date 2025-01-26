@@ -31,6 +31,7 @@ pub enum Command {
 	Vote {},
 	AppendCommand (Box<Command>),
 	Response { src: usize, term: usize, index: usize, confirmation: bool },
+	UpdateCommitIndex { index: usize },
 }
 
 // TODO: add other useful structures and implementations
@@ -187,6 +188,7 @@ impl Actor {
 							self.current_leader = Some(src);
 							// update election timeout
 							self.timeout = Instant::now() + election_timeout;
+							let follower_index;
 
 							match log_item {
 								Some(item) => {
@@ -197,16 +199,24 @@ impl Actor {
 
 									if let Some(follower_item) = self.log.last() {
 										// Get the index of the last element
-										let index = self.log.len() - 1;
+										follower_index = Some(self.log.len() - 1);
+
 
 										// if follower item term in log == term of prev. item in leader log, then ok
 										if follower_item.0 == item.previous_term {
 											// if follower item index in log == prev. item index in leader log, then ok
-											if item.index > 0 && index == item.index - 1 {
+											if follower_index.unwrap() == item.index - 1 {
 												confirmation = true;
 											}
 										}
-									} else { confirmation = true; }
+									} else {
+										// Log is empty
+										follower_index = Some(0);
+										if item.index == 0 {
+											confirmation = true;
+										}
+									}
+
 
 									// If it not the right item - we delete it from log and send Response without confirmation, that leader tries again with next log item
 									if !confirmation {self.log.pop();}
@@ -216,11 +226,11 @@ impl Actor {
 										if connection.encode(Command::Response {
 											src: self.node.address,
 											term,
-											index: item.index,
+											index: follower_index.unwrap_or(0),
 											confirmation,
 										}).is_ok() && confirmation {
 											self.log.push((term, item.command));
-											debug!(?self.log, "Updated Log.");
+											trace!(?self.log, "Updated Log.");
 										} else {
 											trace!(src, term, "Failed to send response.");
 										}
@@ -253,23 +263,22 @@ impl Actor {
 					}
 
 					// Respond from Followers to leader, after asking append Entries to the log
-					Command::Response { src, term, index, confirmation } => {
+					Command::Response { src, term, mut index, confirmation } => {
 						if self.state == ActorState::Leader && self.current_term == term {
-							if confirmation {
-								// check if you can do this command
-								// let permission = self.is_possible_to_do(*command.clone());
-								// if permission {
-								//
-								// } else { trace!(self.node.address, self.current_term, ?command, "Command rejected"); }
-							} else {
-								// Send to follower to restore log
-								let next_index = if self.log.len() == 0 || index == 0 {
-									0
-								} else {
-									index - 1
-								};
 
-								let log_item = Some(Box::new(self.create_log_item(next_index)));
+							if confirmation {
+								// save log index for follower
+								self.connections_index.insert(src, Some(index + 1));
+
+								self.commit(src, index + 1);
+							} else {
+								if index > 0 {
+									index = self.log.len() -1;
+								} else {
+									index = 0;
+								}
+
+								let log_item = Some(Box::new(self.create_log_item(index)));
 
 								if let Some(connection) = self.connections.get(&src) {
 									if connection.encode(Command::AppendEntries {
@@ -284,6 +293,11 @@ impl Actor {
 								}
 							}
 						}
+					}
+
+					Command::UpdateCommitIndex { index } => {
+						trace!("update commit index for {:?}", index);
+						self.commit_index = Option::from(index);
 					}
 				}
 			}
@@ -420,6 +434,27 @@ Send RequestVote RPCs to all other servers, retry until either:
 			_ => {false}
 		}
 	}
+	fn do_stuff(&mut self, command: Command) {
+		match command {
+			Command::Open { account } => {
+				self.db.open_account(&account);
+				self.node.append(&Command::Open { account });
+			},
+			Command::Deposit { account, amount } => {
+				self.db.deposit_money(&account, amount);
+				self.node.append(&Command::Deposit { account, amount });
+			},
+			Command::Withdraw { account, amount } => {
+				self.db.withdraw_money(&account, amount);
+				self.node.append(&Command::Withdraw { account, amount });
+			},
+			Command::Transfer { src, dst, amount } => {
+				self.db.transfer_money(&src, &dst, amount);
+				self.node.append(&Command::Transfer { src, dst, amount })
+			},
+			_ => {}
+		}
+	}
 
 	fn create_log_item(&mut self, index: usize) -> LogItem {
 		// Get the term of the previous entry, or 0 if out of bounds
@@ -435,6 +470,65 @@ Send RequestVote RPCs to all other servers, retry until either:
 			command: self.log[index].1.clone(),
 		}
 	}
+
+	fn commit(&mut self, src: usize, index: usize) {
+		// Count addresses with index >= nextIndex
+		let count = self.connections_index
+			.iter()
+			.filter(|&(_, &next_index)| match (index, next_index) {
+				(index, Some(value)) => value >= index,
+				_ => false,
+			})
+			.count();
+
+		if count >= (self.connections.len() + 1) / 2 {
+			// Update commit index to the highest confirmed index
+			let new_commit_index = self.commit_index.map_or(index, |current| current.max(index));
+
+			// Execute commands between the old and new commit indices
+			if let Some(old_commit_index) = self.commit_index {
+				for i in (old_commit_index + 1)..=new_commit_index {
+					if let Some((_, command)) = self.log.get(i) {
+						if self.is_possible_to_do(command.clone()) {
+							self.do_stuff(command.clone());
+						} else {
+							trace!("{:?} {}", command, "Command rejected");
+						}
+					}
+				}
+			} else {
+				// Handle the first-time commit
+				for i in 0..=new_commit_index {
+					if let Some((_, command)) = self.log.get(i) {
+						if self.is_possible_to_do(command.clone()) {
+							self.do_stuff(command.clone());
+						} else {
+							trace!("{:?} {}", command, "Command rejected");
+						}
+					}
+				}
+			}
+
+			// Update the commit index
+			self.commit_index = Some(new_commit_index);
+			trace!(?self.commit_index, "Updated commit_index");
+
+			// Notify followers of the updated commit index
+			if let Some(connection) = self.connections.get(&src) {
+				if connection.encode(Command::UpdateCommitIndex {
+					index: self.commit_index.unwrap(),
+				}).is_ok() {
+					trace!(?connection, "UpdateCommitIndex sent successfully");
+				} else {
+					trace!(?connection, "Failed to send command UpdateCommitIndex");
+				}
+			}
+
+		} else {
+			trace!(?count, ?index, "Not enough followers confirmed for commit");
+		}
+	}
+
 }
 
 

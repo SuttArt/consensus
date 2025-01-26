@@ -71,7 +71,7 @@ fn main() -> io::Result<()> {
 		// customer requests start with the branch office index,
 		// followed by the source account name and a list of requests
 		[0] "Weber"   => open(), deposit( 50);
-		[5] "Weber"   => open();
+		[5] "Weber"   => open(); // wont be logged
 		[1] "Redlich" => open(), deposit(100);
 		sleep();
 		[2] "Redlich" => transfer("Weber", 20);
