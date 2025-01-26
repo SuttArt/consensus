@@ -190,41 +190,41 @@ impl Actor {
 
 							match log_item {
 								Some(item) => {
-									debug!(?item.command);
 									// Add log item to log
 									// AppendEntries Consistency Check
 									// Repairing Follower Logs
-/*									let mut confirmation = false;
+									let mut confirmation = false;
 
-									if let Some(follower_item) = self.create_log_item_follower(item.index) {
+									if let Some(follower_item) = self.log.last() {
+										// Get the index of the last element
+										let index = self.log.len() - 1;
+
 										// if follower item term in log == term of prev. item in leader log, then ok
-										if follower_item.current_term == item.previous_term {
+										if follower_item.0 == item.previous_term {
 											// if follower item index in log == prev. item index in leader log, then ok
-											if follower_item.index == item.index - 1 {
+											if item.index > 0 && index == item.index - 1 {
 												confirmation = true;
 											}
 										}
-									} else {
-										if self.log.is_empty() {
-											confirmation = true;
-										}
-									}*/
+									} else { confirmation = true; }
+
+									// If it not the right item - we delete it from log and send Response without confirmation, that leader tries again with next log item
+									if !confirmation {self.log.pop();}
 
 									// Send Response
-/*									if let Some(connection) = self.connections.get(&src) {
+									if let Some(connection) = self.connections.get(&src) {
 										if connection.encode(Command::Response {
 											src: self.node.address,
 											term,
 											index: item.index,
 											confirmation,
 										}).is_ok() && confirmation {
-											self.log.truncate(item.index);
 											self.log.push((term, item.command));
-											trace!(?self.log, "Updated Log.");
+											debug!(?self.log, "Updated Log.");
 										} else {
 											trace!(src, term, "Failed to send response.");
 										}
-									}*/
+									}
 								}
 								None => {
 									// Just heartbeat
